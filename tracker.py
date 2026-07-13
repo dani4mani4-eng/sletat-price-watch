@@ -53,6 +53,7 @@ HEADERS = {
 
 # Индексы колонок в строке aaData (разобраны по живому ответу API)
 C_TOURID = 0
+C_SOURCE = 1
 C_ROOM_RU = 9
 C_MEAL = 10
 C_DEPART = 12
@@ -164,7 +165,7 @@ def fetch_tours(cfg):
         if rows and len(pending) <= 2:
             # большинство операторов ответили — хватит ждать «долгих»
             break
-    return rows
+    return rows, rid
 
 
 def match(row, flt):
@@ -194,10 +195,20 @@ def best_offer(rows, flt):
         "ret": best[C_RETURN],
         "nights": best[C_NIGHTS],
         "operator": best[C_OPERATOR],
+        "source": best[C_SOURCE],
+        "tourId": best[C_TOURID],
         "matched": len(cand),
         "total": len(rows),
     }
     return offer, len(rows)
+
+
+def offer_link(offer, request_id):
+    """Прямая ссылка на страницу конкретного предложения (как /checkout/...)."""
+    return (
+        f"https://sletat.ru/checkout/"
+        f"{offer['source']}-{offer['tourId']}-{request_id}?source_type=b2c_search"
+    )
 
 
 def read_history(days):
@@ -262,7 +273,7 @@ def main():
     now = datetime.now(timezone.utc)
 
     try:
-        rows = fetch_tours(cfg)
+        rows, request_id = fetch_tours(cfg)
     except Exception as e:
         log(f"ОШИБКА запроса к API: {e}")
         return 1
@@ -343,7 +354,7 @@ def main():
         f"📅 {offer['depart']} → {offer['ret']} ({offer['nights']} ночей)\n"
         f"👨‍👩‍👧‍👦 {cfg['поездка']['взрослых']} взр + дети {cfg['поездка']['возраст_детей']}\n"
         f"🏢 Оператор: {offer['operator']}\n\n"
-        f"➡️ https://sletat.ru/turkey/acisu/gloria_golf_resort/\n\n"
+        f"➡️ <a href=\"{offer_link(offer, request_id)}\">Открыть это предложение на слетать.ру</a>\n\n"
         f"<i>{'; '.join(reasons)}</i>"
     )
     ok = send_telegram(token, chat, text)
