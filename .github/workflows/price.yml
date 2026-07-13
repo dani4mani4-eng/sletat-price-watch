@@ -1,0 +1,44 @@
+name: Слежка за ценой слетать.ру
+
+on:
+  schedule:
+    - cron: '*/16 * * * *'   # каждые ~16 минут (по UTC; GitHub может задержать на пару минут)
+  workflow_dispatch:          # кнопка ручного запуска
+
+permissions:
+  contents: write             # чтобы дописывать историю цен обратно в хранилище
+
+concurrency:
+  group: price-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Забрать код и историю
+        uses: actions/checkout@v4
+
+      - name: Поставить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Проверить цену и, если надо, отправить сигнал
+        env:
+          SLETAT_TG_BOT_TOKEN: ${{ secrets.SLETAT_TG_BOT_TOKEN }}
+          SLETAT_TG_CHAT_ID: ${{ secrets.SLETAT_TG_CHAT_ID }}
+        run: python3 tracker.py
+
+      - name: Сохранить историю цен
+        run: |
+          git config user.name "price-bot"
+          git config user.email "price-bot@users.noreply.github.com"
+          git add data/history.jsonl data/state.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "нет изменений"
+          else
+            git commit -m "история цен $(date -u +%Y-%m-%dT%H:%MZ)"
+            git pull --rebase --autostash origin ${{ github.ref_name }} || true
+            git push
+          fi
