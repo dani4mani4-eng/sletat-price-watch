@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Слежка за ценами на авиабилеты (Магнитогорск ↔ Москва и т.п.).
+Слежка за ценами на авиабилеты на СТРОГО заданные даты (живой поиск Aviasales).
 
-Источник цен — открытый ценовой календарь Aviasales, который использует
-виджет билетов на слетать.ру (endpoint apistp.com GraphQL prices_round_trip).
-Работает без авторизации и без браузера: обычный POST-запрос.
+Источник — живой поиск билетов виджета слетать.ру (aviasales.sletat.ru).
+Живой поиск закрыт для «безголового» робота (403), поэтому используем
+настоящий браузер (Playwright, headless=False). В облаке он запускается
+под виртуальным экраном xvfb.
 
-Важно: календарь отдаёт минимальные цены по датам, которые недавно искали.
-По строго заданным датам цена бывает не всегда — тогда замер пропускается.
+Для каждой поездки открываем ссылку поиска, перехватываем ответы движка
+(/search/wl/results) и берём минимальную цену туда-обратно на точные даты.
 
 Логика сигналов та же, что у трекера туров: копим историю по каждой поездке,
-и если цена упала на N% от обычной (или ниже заданной суммы) — шлём в Telegram.
+и если цена упала на N% от обычной (или ниже суммы) — шлём в Telegram.
 """
 
 import json
 import os
-import ssl
 import sys
+import time
 import statistics
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta
 
-import tracker  # переиспользуем send_telegram, load_secrets, rub, _urlopen
+import tracker  # send_telegram, load_secrets, rub
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "flights.json")
@@ -31,18 +30,6 @@ DATA_DIR = os.path.join(HERE, "data")
 HISTORY_PATH = os.path.join(DATA_DIR, "flights_history.jsonl")
 STATE_PATH = os.path.join(DATA_DIR, "flights_state.json")
 LOG_PATH = os.path.join(DATA_DIR, "flights.log")
-
-GQL_URL = "https://api.apistp.com/whitelabels/web/flights/v1/prices/graphql/query"
-GQL_QUERY = (
-    "query Q($origin: String!, $destination: String!, $limit: Int!, $offset: Int!, "
-    "$minDepartStart: Date!, $maxDepartStart: Date!, $minReturnStart: Date!, $maxReturnStart: Date!, "
-    "$currency: String!, $withBaggage: Boolean, $directOnly: Boolean, $tripClass: TripClass) { "
-    "prices_round_trip(paging: {offset: $offset, limit: $limit}, params: {origin: $origin, "
-    "destination: $destination, depart_date_min: $minDepartStart, depart_date_max: $maxDepartStart, "
-    "return_date_min: $minReturnStart, return_date_max: $maxReturnStart, with_baggage: $withBaggage, "
-    "direct: $directOnly, trip_class: $tripClass}, currency: $currency) "
-    "{ departure_at return_at value __typename } }"
-)
 
 
 def log(msg):
@@ -58,64 +45,76 @@ def load_config():
         return json.load(f)
 
 
-def _shift(iso, days):
-    y, m, d = map(int, iso.split("-"))
-    return (date(y, m, d) + timedelta(days=days)).isoformat()
+def ddmm(iso):
+    return datetime.fromisoformat(iso).strftime("%d.%m")
 
 
-def query_prices(route, dep, ret, span=5):
-    """Спрашиваем календарь по диапазону вокруг дат (min==max сервер не любит)."""
-    variables = {
-        "origin": route["откуда_код"],
-        "destination": route["куда_код"],
-        "limit": 365,
-        "offset": 0,
-        "minDepartStart": _shift(dep, -span),
-        "maxDepartStart": _shift(dep, span),
-        "minReturnStart": _shift(ret, -span),
-        "maxReturnStart": _shift(ret, span),
-        "currency": "RUB",
-        "directOnly": False,
-        "withBaggage": False,
-        "tripClass": "Y",
-    }
-    body = json.dumps({"operationName": "Q", "variables": variables, "query": GQL_QUERY}).encode()
-    req = urllib.request.Request(
-        GQL_URL,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "*/*",
-            "Referer": "https://aviasales.sletat.ru/",
-            "Origin": "https://aviasales.sletat.ru",
-            "User-Agent": "Mozilla/5.0",
-            "affiliate-marker": str(route["affiliate_marker"]),
-        },
-    )
-    with tracker._urlopen(req) as r:
-        data = json.loads(r.read().decode("utf-8"))
-    return (data.get("data") or {}).get("prices_round_trip") or []
-
-
-def best_for_trip(route, trip, flex):
-    """Минимальная цена в пределах гибкости дней от заданных дат."""
-    rows = query_prices(route, trip["туда"], trip["обратно"])
-    cand = []
-    for x in rows:
-        dp = x["departure_at"][:10]
-        rp = x["return_at"][:10]
-        if abs((date.fromisoformat(dp) - date.fromisoformat(trip["туда"])).days) <= flex and \
-           abs((date.fromisoformat(rp) - date.fromisoformat(trip["обратно"])).days) <= flex:
-            cand.append({"price": int(round(x["value"])), "depart": dp, "ret": rp})
-    if not cand:
-        return None
-    return min(cand, key=lambda c: c["price"])
+def search_code(route, depart, ret):
+    d = datetime.fromisoformat(depart).strftime("%d%m")
+    r = datetime.fromisoformat(ret).strftime("%d%m")
+    return f"{route['откуда_код']}{d}{route['куда_код']}{r}1"  # 1 пассажир, эконом
 
 
 def flight_link(route, depart, ret):
-    d = datetime.fromisoformat(depart).strftime("%d%m")
-    r = datetime.fromisoformat(ret).strftime("%d%m")
-    return f"https://aviasales.sletat.ru/search/{route['откуда_код']}{d}{route['куда_код']}{r}1"
+    return f"https://aviasales.sletat.ru/search/{search_code(route, depart, ret)}"
+
+
+def _min_price(bodies):
+    """Минимальная цена туда-обратно из ответов /results."""
+    prices = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in ("value", "price", "unified_price") and isinstance(v, (int, float)) and v > 5000:
+                    prices.append(v)
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    for b in bodies:
+        walk(b)
+    return int(min(prices)) if prices else None
+
+
+def fetch_live_prices(route, trips, wait_s=26):
+    """Открываем браузер один раз и по очереди ищем цены по каждой поездке."""
+    from playwright.sync_api import sync_playwright
+
+    out = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        for trip in trips:
+            code = search_code(route, trip["туда"], trip["обратно"])
+            bodies = []
+            page = browser.new_page()
+
+            def on_resp(resp, _b=bodies):
+                if "/search/wl/results" in resp.url:
+                    try:
+                        _b.append(resp.json())
+                    except Exception:
+                        pass
+
+            page.on("response", on_resp)
+            try:
+                page.goto(f"https://aviasales.sletat.ru/search/{code}",
+                          wait_until="domcontentloaded", timeout=60000)
+                waited = 0
+                while waited < wait_s * 1000:
+                    page.wait_for_timeout(2000)  # прокачивает цикл событий (в отличие от time.sleep)
+                    waited += 2000
+                    if _min_price(bodies) and len(bodies) > 4:
+                        break
+                out[trip["id"]] = _min_price(bodies)
+            except Exception as e:
+                log(f"{trip['id']}: ошибка браузера — {e}")
+                out[trip["id"]] = None
+            finally:
+                page.close()
+        browser.close()
+    return out
 
 
 def read_history(days):
@@ -159,29 +158,12 @@ def save_state(st):
         json.dump(st, f, ensure_ascii=False, indent=2)
 
 
-def ddmm(iso):
-    return datetime.fromisoformat(iso).strftime("%d.%m")
-
-
-def process_trip(route, trip, sig, flex, state, now):
-    try:
-        offer = best_for_trip(route, trip, flex)
-    except Exception as e:
-        log(f"{trip['id']}: ошибка запроса — {e}")
-        return
-    if not offer:
-        log(f"{trip['id']} ({ddmm(trip['туда'])}→{ddmm(trip['обратно'])}): цены на эти даты сейчас нет в календаре.")
-        return
-
-    price = offer["price"]
+def evaluate(route, trip, price, sig, state, now):
     append_history({
-        "ts": now.isoformat(),
-        "trip": trip["id"],
-        "price": price,
-        "depart": offer["depart"],
-        "ret": offer["ret"],
+        "ts": now.isoformat(), "trip": trip["id"], "price": price,
+        "depart": trip["туда"], "ret": trip["обратно"],
     })
-    log(f"{trip['id']} ({ddmm(offer['depart'])}→{ddmm(offer['ret'])}): {tracker.rub(price)}")
+    log(f"{trip['id']} ({ddmm(trip['туда'])}→{ddmm(trip['обратно'])}): {tracker.rub(price)}")
 
     hist = [h for h in read_history(sig["окно_базовой_цены_дней"]) if h.get("trip") == trip["id"]]
     prev = [h["price"] for h in hist[:-1]]
@@ -193,39 +175,33 @@ def process_trip(route, trip, sig, flex, state, now):
         drop = (baseline - price) / baseline * 100
         if drop >= sig["порог_падения_процент"]:
             reasons.append(f"Цена упала на {drop:.0f}% ({tracker.rub(baseline)} → {tracker.rub(price)})")
-
     target = sig.get("целевая_цена")
     if target and price <= target:
         reasons.append(f"Цена ниже вашей планки {tracker.rub(target)}")
-
     if not reasons:
         return
 
     tstate = state.get(trip["id"], {})
     last_price = tstate.get("last_alert_price")
     last_ts = tstate.get("last_alert_ts")
-    should = True
     if last_price is not None and last_ts:
         hours = (now - datetime.fromisoformat(last_ts)).total_seconds() / 3600
         further = price <= last_price * (1 - sig["повтор_при_доп_падении_процент"] / 100)
         if hours < sig["не_повторять_сигнал_часов"] and not further:
-            should = False
-    if not should:
-        log(f"{trip['id']}: выгодно, но сигнал слали недавно — молчу.")
-        return
+            log(f"{trip['id']}: выгодно, но сигнал слали недавно — молчу.")
+            return
 
     token, chat = tracker.load_secrets()
     if not token or not chat:
         log("нет токена/chat_id — не отправить.")
         return
-
     base_line = f"\nОбычная цена ~{tracker.rub(baseline)}" if baseline else ""
     text = (
         f"✈️ <b>Дешёвый билет!</b>\n"
         f"<b>{route['откуда']} → {route['куда']} → {route['откуда']}</b>\n\n"
         f"💰 <b>{tracker.rub(price)}</b> за 1 пассажира, туда-обратно{base_line}\n"
-        f"📅 Туда {ddmm(offer['depart'])}, обратно {ddmm(offer['ret'])}\n\n"
-        f"➡️ <a href=\"{flight_link(route, offer['depart'], offer['ret'])}\">Открыть билеты на слетать.ру</a>\n\n"
+        f"📅 Туда {ddmm(trip['туда'])}, обратно {ddmm(trip['обратно'])}\n\n"
+        f"➡️ <a href=\"{flight_link(route, trip['туда'], trip['обратно'])}\">Открыть билеты на слетать.ру</a>\n\n"
         f"<i>{'; '.join(reasons)}</i>"
     )
     if tracker.send_telegram(token, chat, text):
@@ -239,11 +215,16 @@ def main():
     cfg = load_config()
     route = cfg["маршрут"]
     sig = cfg["сигнал"]
-    flex = int(cfg.get("гибкость_дней", 0))
     now = datetime.now(timezone.utc)
     state = load_state()
+
+    prices = fetch_live_prices(route, cfg["поездки"])
     for trip in cfg["поездки"]:
-        process_trip(route, trip, sig, flex, state, now)
+        price = prices.get(trip["id"])
+        if not price:
+            log(f"{trip['id']} ({ddmm(trip['туда'])}→{ddmm(trip['обратно'])}): цена не получена (поиск не отдал результат).")
+            continue
+        evaluate(route, trip, price, sig, state, now)
     save_state(state)
     return 0
 

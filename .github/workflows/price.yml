@@ -30,17 +30,11 @@ jobs:
           SLETAT_TG_CHAT_ID: ${{ secrets.SLETAT_TG_CHAT_ID }}
         run: python3 tracker.py
 
-      - name: Проверить цены на авиабилеты и, если надо, отправить сигнал
-        env:
-          SLETAT_TG_BOT_TOKEN: ${{ secrets.SLETAT_TG_BOT_TOKEN }}
-          SLETAT_TG_CHAT_ID: ${{ secrets.SLETAT_TG_CHAT_ID }}
-        run: python3 flights.py
-
       - name: Сохранить историю цен
         run: |
           git config user.name "price-bot"
           git config user.email "price-bot@users.noreply.github.com"
-          git add data/history.jsonl data/state.json data/flights_history.jsonl data/flights_state.json 2>/dev/null || true
+          git add data/history.jsonl data/state.json 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "нет изменений"
           else

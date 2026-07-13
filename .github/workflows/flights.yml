@@ -1,0 +1,55 @@
+name: Слежка за авиабилетами
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # каждые ~30 минут (живой поиск — щадящая частота, чтобы не заблокировали)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: flights-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Забрать код и историю
+        uses: actions/checkout@v4
+
+      - name: Поставить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Кэш браузера Playwright
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-v1
+
+      - name: Установить Playwright + Chromium
+        run: |
+          python3 -m pip install --quiet playwright
+          python3 -m playwright install --with-deps chromium
+
+      - name: Проверить цены на билеты (браузер под xvfb)
+        env:
+          SLETAT_TG_BOT_TOKEN: ${{ secrets.SLETAT_TG_BOT_TOKEN }}
+          SLETAT_TG_CHAT_ID: ${{ secrets.SLETAT_TG_CHAT_ID }}
+        run: xvfb-run -a python3 flights.py
+
+      - name: Сохранить историю цен на билеты
+        run: |
+          git config user.name "flights-bot"
+          git config user.email "flights-bot@users.noreply.github.com"
+          git add data/flights_history.jsonl data/flights_state.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "нет изменений"
+          else
+            git commit -m "история цен билетов $(date -u +%Y-%m-%dT%H:%MZ)"
+            git pull --rebase --autostash origin ${{ github.ref_name }} || true
+            git push
+          fi
