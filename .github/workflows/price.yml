@@ -2,7 +2,7 @@ name: Слежка за ценой слетать.ру
 
 on:
   schedule:
-    - cron: '*/16 * * * *'   # каждые ~16 минут (по UTC; GitHub может задержать на пару минут)
+    - cron: '*/5 * * * *'    # каждые ~5 минут (минимум у GitHub; может задержать на пару минут при нагрузке)
   workflow_dispatch:          # кнопка ручного запуска
 
 permissions:
@@ -24,17 +24,23 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Проверить цену и, если надо, отправить сигнал
+      - name: Проверить цену на отель и, если надо, отправить сигнал
         env:
           SLETAT_TG_BOT_TOKEN: ${{ secrets.SLETAT_TG_BOT_TOKEN }}
           SLETAT_TG_CHAT_ID: ${{ secrets.SLETAT_TG_CHAT_ID }}
         run: python3 tracker.py
 
+      - name: Проверить цены на авиабилеты и, если надо, отправить сигнал
+        env:
+          SLETAT_TG_BOT_TOKEN: ${{ secrets.SLETAT_TG_BOT_TOKEN }}
+          SLETAT_TG_CHAT_ID: ${{ secrets.SLETAT_TG_CHAT_ID }}
+        run: python3 flights.py
+
       - name: Сохранить историю цен
         run: |
           git config user.name "price-bot"
           git config user.email "price-bot@users.noreply.github.com"
-          git add data/history.jsonl data/state.json 2>/dev/null || true
+          git add data/history.jsonl data/state.json data/flights_history.jsonl data/flights_state.json 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "нет изменений"
           else
