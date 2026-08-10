@@ -6,5 +6,9 @@
   "oct": {
     "last_alert_price": 21958,
     "last_alert_ts": "2026-08-07T18:32:55.734638+00:00"
+  },
+  "aug": {
+    "last_alert_price": 24622,
+    "last_alert_ts": "2026-08-10T14:37:36.243825+00:00"
   }
 }
